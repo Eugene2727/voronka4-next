@@ -25,6 +25,9 @@ export default function SpecialPage() {
 	const sdkInitRef = useRef(false)
 	const submitCardRef = useRef<any>(null)
 
+	// НОВЫЙ РЕФ ДЛЯ ХРАНЕНИЯ SDK (чтобы убивать его при ошибке)
+	const sdkInstanceRef = useRef<any>(null)
+
 	// ==========================================
 	// 1. ПРОВЕРКА EMAIL И ИНИЦИАЛИЗАЦИЯ
 	// ==========================================
@@ -60,12 +63,18 @@ export default function SpecialPage() {
 	}, [])
 
 	// ==========================================
-	// 3. ПОДКЛЮЧЕНИЕ ПЛАТЕЖНОГО ШЛЮЗА
+	// 3. ПОДКЛЮЧЕНИЕ ПЛАТЕЖНОГО ШЛЮЗА С РЕСТАРТОМ
 	// ==========================================
-	const preparePayment = async (targetEmail: string) => {
-		// Блокируем повторные вызовы сразу же (спасает от StrictMode дублей)
-		if (sdkInitRef.current) return
+	const preparePayment = async (targetEmail: string, forceRetry = false) => {
+		// Блокируем повторные вызовы, кроме принудительного рестарта
+		if (sdkInitRef.current && !forceRetry) return
 		sdkInitRef.current = true
+
+		if (forceRetry) {
+			setOverlayMsg('Regenerating secure connection...')
+		} else {
+			setOverlayMsg('Securing payment connection...')
+		}
 
 		try {
 			const response = await fetch(
@@ -90,16 +99,19 @@ export default function SpecialPage() {
 				throw new Error('Failed to get transaction ID')
 			}
 
-			await initTruegateSDK(data.payment_widget.transactionId)
+			// Пробрасываем email дальше для возможного рестарта
+			await initTruegateSDK(data.payment_widget.transactionId, targetEmail)
 		} catch (error) {
-			// В случае ошибки разрешаем повторную инициализацию
 			sdkInitRef.current = false
 			setOverlayMsg('Error loading payment form. Refresh page.')
 			setErrorMsg('Error loading payment form. Refresh page.')
 		}
 	}
 
-	const initTruegateSDK = async (transactionId: string) => {
+	const initTruegateSDK = async (
+		transactionId: string,
+		targetEmail: string,
+	) => {
 		await new Promise<void>(resolve => {
 			if (window.truegateSdk) resolve()
 			else {
@@ -109,10 +121,24 @@ export default function SpecialPage() {
 			}
 		})
 
+		// 1. УБИВАЕМ СТАРЫЙ SDK ПЕРЕД СОЗДАНИЕМ НОВОГО
+		if (sdkInstanceRef.current) {
+			if (typeof sdkInstanceRef.current.destroy === 'function') {
+				try {
+					sdkInstanceRef.current.destroy()
+				} catch (e) {
+					console.warn('Destroy error:', e)
+				}
+			}
+			sdkInstanceRef.current = null
+			submitCardRef.current = null
+		}
+
+		// 2. СОЗДАЕМ НОВЫЙ SDK
 		const sdkInstance = new window.truegateSdk({
 			id: 'payment-instance',
 			transactionId: transactionId,
-			env: 'PROD', // Включен боевой режим
+			env: 'PROD',
 		})
 
 		sdkInstance.on('PAYMENT_STATUS', (payload: any) => {
@@ -121,8 +147,16 @@ export default function SpecialPage() {
 				setErrorMsg('🎉 Payment successful! Redirecting...')
 				setTimeout(() => (window.location.href = '/thankyou'), 1500)
 			} else if (payload.details.status === 'FAILED') {
-				setErrorMsg('Payment declined by your bank. Try another card.')
-				resetPayButton()
+				// 3. ПРИ ОШИБКЕ БЛОКИРУЕМ И ЗАПУСКАЕМ РЕСТАРТ
+				setErrorMsg('Payment declined. Generating a new secure form...')
+				setIsPayDisabled(true)
+				setPayBtnText('Reloading...')
+
+				setTimeout(() => {
+					setErrorMsg('')
+					setIsSdkReady(false) // Возвращаем белый оверлей
+					preparePayment(targetEmail, true) // Запускаем с флагом forceRetry
+				}, 1500)
 			}
 		})
 
@@ -133,8 +167,11 @@ export default function SpecialPage() {
 
 		await sdkInstance.init()
 
+		// 4. СОХРАНЯЕМ ИНСТАНС ДЛЯ БУДУЩЕГО УДАЛЕНИЯ
+		sdkInstanceRef.current = sdkInstance
+
 		try {
-			// Дополнительная защита: очищаем контейнеры перед вставкой iframe SDK, чтобы они точно не продублировались
+			// Дополнительная защита: очищаем контейнеры перед вставкой iframe
 			const cardNumEl = document.getElementById('card-number')
 			const cardExpEl = document.getElementById('card-expiration')
 			const cardCvvEl = document.getElementById('card-cvv')
@@ -155,6 +192,16 @@ export default function SpecialPage() {
 					PLACEHOLDER_CARD_NUMBER: '0000 0000 0000 0000',
 					PLACEHOLDER_EXPIRATION: 'MM / YY',
 					PLACEHOLDER_SECURITY_CODE: 'CVC',
+					CUSTOM_CSS: `
+						input[type="number"]::-webkit-outer-spin-button,
+						input[type="number"]::-webkit-inner-spin-button {
+							-webkit-appearance: none !important;
+							margin: 0 !important;
+						}
+						input[type="number"] {
+							-moz-appearance: textfield !important;
+						}
+					`,
 				},
 			})
 			submitCardRef.current = result.submit
@@ -162,6 +209,7 @@ export default function SpecialPage() {
 			// SDK готово - скрываем оверлей загрузки и включаем кнопку
 			setIsSdkReady(true)
 			setIsPayDisabled(false)
+			setPayBtnText('PAY')
 		} catch (e) {
 			console.error('SDK Fields Init Error', e)
 		}
@@ -196,7 +244,6 @@ export default function SpecialPage() {
 				strategy='afterInteractive'
 			/>
 
-			{/* Встроенные стили для оверлея и iframe */}
 			<style
 				dangerouslySetInnerHTML={{
 					__html: `
@@ -205,6 +252,9 @@ export default function SpecialPage() {
 				.relative-container { position: relative; }
 				div.custom-input { height: 48px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 0 16px; display: flex; align-items: center; width: 100%; box-sizing: border-box; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05); }
 				div.custom-input iframe { width: 100% !important; height: 100% !important; border: none !important; outline: none !important; background: transparent !important; }
+				
+				/* ЖЕСТКИЙ ФИКС ОТ ДУБЛЕЙ IFRAME */
+				div.custom-input iframe:nth-of-type(n+2) { display: none !important; }
 			`,
 				}}
 			/>

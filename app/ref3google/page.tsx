@@ -69,11 +69,15 @@ export default function SpecialPage() {
 	const clickIdRef = useRef<string>('')
 	const sdkInitRef = useRef(false)
 	const submitCardRef = useRef<any>(null)
+
+	// НОВЫЙ РЕФ ДЛЯ ХРАНЕНИЯ ЭКЗЕМПЛЯРА SDK (ДЛЯ УДАЛЕНИЯ ПРИ ОШИБКЕ)
+	const sdkInstanceRef = useRef<any>(null)
+
 	const typingTimerRef = useRef<NodeJS.Timeout | null>(null)
 	const currentEmailRef = useRef<string | null>(null)
 	const isFetchingWidgetRef = useRef(false)
 
-	// Константы из вашего JS
+	// Константы
 	const API_BASE = 'https://wa-adminn.com'
 	const PLAN_CODE = 'trial_month'
 
@@ -216,20 +220,37 @@ export default function SpecialPage() {
 	}
 
 	// ==========================================
-	// ИНИЦИАЛИЗАЦИЯ ПЛАТЕЖА И SDK
+	// ИНИЦИАЛИЗАЦИЯ ПЛАТЕЖА С ФЛАГОМ REFRESH
 	// ==========================================
 	const preparePayment = async (
 		emailValue: string,
 		isNewUser: boolean = false,
+		forceRetry: boolean = false, // Добавлен флаг принудительного рестарта
 	) => {
 		if (isFetchingWidgetRef.current) return
-		if (sdkInitRef.current && emailValue === currentEmailRef.current) return
+		// Блокируем вызов, если это не рестарт, email тот же и SDK уже запущен
+		if (
+			!forceRetry &&
+			sdkInitRef.current &&
+			emailValue === currentEmailRef.current
+		)
+			return
 
 		isFetchingWidgetRef.current = true
-		showOverlayLoading('Securing payment connection...')
+
+		// Текст оверлея зависит от того, рестарт это или первичная загрузка
+		showOverlayLoading(
+			forceRetry
+				? 'Regenerating secure connection...'
+				: 'Securing payment connection...',
+		)
 		setIsPayDisabled(true)
 
-		if (sdkInitRef.current && emailValue !== currentEmailRef.current) {
+		// Сбрасываем флаги
+		if (
+			forceRetry ||
+			(sdkInitRef.current && emailValue !== currentEmailRef.current)
+		) {
 			sdkInitRef.current = false
 			submitCardRef.current = null
 		}
@@ -291,7 +312,8 @@ export default function SpecialPage() {
 				throw new Error('Payment service temporarily unavailable.')
 
 			currentEmailRef.current = emailValue
-			await initTruegateSDK(data.payment_widget.transactionId)
+			// Передаем email дальше, чтобы в случае ошибки знать, кого рестартовать
+			await initTruegateSDK(data.payment_widget.transactionId, emailValue)
 		} catch (error: any) {
 			showOverlayError(error.message)
 		} finally {
@@ -299,7 +321,10 @@ export default function SpecialPage() {
 		}
 	}
 
-	const initTruegateSDK = async (transactionId: string) => {
+	const initTruegateSDK = async (
+		transactionId: string,
+		targetEmail: string,
+	) => {
 		if (sdkInitRef.current) return
 
 		await new Promise<void>(resolve => {
@@ -311,6 +336,20 @@ export default function SpecialPage() {
 			}
 		})
 
+		// 1. УБИВАЕМ СТАРЫЙ SDK ПЕРЕД СОЗДАНИЕМ НОВОГО
+		if (sdkInstanceRef.current) {
+			if (typeof sdkInstanceRef.current.destroy === 'function') {
+				try {
+					sdkInstanceRef.current.destroy()
+				} catch (e) {
+					console.warn('Destroy error:', e)
+				}
+			}
+			sdkInstanceRef.current = null
+			submitCardRef.current = null
+		}
+
+		// 2. СОЗДАЕМ НОВЫЙ SDK
 		const sdkInstance = new window.truegateSdk({
 			id: 'payment-instance',
 			transactionId: transactionId,
@@ -325,8 +364,18 @@ export default function SpecialPage() {
 					window.location.href = './thankyou' + window.location.search
 				}, 1500)
 			} else if (payload.details.status === 'FAILED') {
-				setErrorMsg('Payment declined by your bank. Try another card.')
-				resetPayButton()
+				// 3. ПРИ ОШИБКЕ БЛОКИРУЕМ И ЗАПУСКАЕМ РЕСТАРТ
+				setErrorMsg('Payment declined. Generating a new secure form...')
+				setIsPayDisabled(true)
+				setPayBtnText('Reloading...')
+
+				setTimeout(() => {
+					setErrorMsg('')
+					// Возвращаем белый оверлей загрузки
+					showOverlayLoading('Regenerating secure connection...')
+					// Запускаем рестарт
+					preparePayment(targetEmail, false, true)
+				}, 1500)
 			}
 		})
 
@@ -338,8 +387,11 @@ export default function SpecialPage() {
 		await sdkInstance.init()
 		sdkInitRef.current = true
 
+		// 4. СОХРАНЯЕМ ИНСТАНС ДЛЯ БУДУЩИХ УДАЛЕНИЙ
+		sdkInstanceRef.current = sdkInstance
+
 		try {
-			// Очистка перед вставкой
+			// Очистка перед вставкой (защита от Hot Reload / дублей)
 			const numEl = document.getElementById('card-number')
 			const expEl = document.getElementById('card-expiration')
 			const cvvEl = document.getElementById('card-cvv')
@@ -359,12 +411,25 @@ export default function SpecialPage() {
 					PLACEHOLDER_CARD_NUMBER: '0000 0000 0000 0000',
 					PLACEHOLDER_EXPIRATION: 'MM / YY',
 					PLACEHOLDER_SECURITY_CODE: 'CVC',
+					CUSTOM_CSS: `
+						input[type="number"]::-webkit-outer-spin-button,
+						input[type="number"]::-webkit-inner-spin-button {
+							-webkit-appearance: none !important;
+							margin: 0 !important;
+						}
+						input[type="number"] {
+							-moz-appearance: textfield !important;
+						}
+					`,
 				},
 			})
 
 			submitCardRef.current = result.submit
+
+			// Форма загружена успешно — прячем оверлей и включаем кнопку
 			setIsOverlayVisible(false)
 			setIsPayDisabled(false)
+			setPayBtnText('PAY')
 			setIsEmailDisabled(true)
 		} catch (err) {
 			console.error('initCardPayment error:', err)
@@ -666,7 +731,6 @@ export default function SpecialPage() {
 						<div className='payment-container' id='payment-form'>
 							{/* Поле email */}
 							<div className='input-group' style={{ marginBottom: '10px' }}>
-								
 								<input
 									type='email'
 									className='custom-input'
@@ -740,7 +804,6 @@ export default function SpecialPage() {
 								</div>
 
 								<div className='input-group'>
-									
 									<div id='card-number' className='custom-input'></div>
 								</div>
 
@@ -753,11 +816,9 @@ export default function SpecialPage() {
 									}}
 								>
 									<div className='input-group' style={{ flex: 1 }}>
-										
 										<div id='card-expiration' className='custom-input'></div>
 									</div>
 									<div className='input-group' style={{ flex: 1 }}>
-										
 										<div id='card-cvv' className='custom-input'></div>
 									</div>
 								</div>
